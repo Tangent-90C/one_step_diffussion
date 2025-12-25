@@ -16,7 +16,7 @@ lambda_GAN: 0.5
 mid_timestep: 244 
 
 output_dir: ./omgsr_trainings/omgsr_sana_1024
-resolution: 512
+resolution: 1024
 train_batch_size: 1
 max_train_steps: 6000
 checkpointing_steps: 100

@@ -2,3 +2,5 @@
 __pycache__/
 experiments_omgsr_f/*
 omgsr_trainings/*
+.venv/
+.vscode/

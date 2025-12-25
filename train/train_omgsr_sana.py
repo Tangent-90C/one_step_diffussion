@@ -352,9 +352,10 @@ def main():
     # bitsandbytes 8-bit optimizers frequently conflict with DeepSpeed ZeRO optimizers.
     # Prefer regular AdamW when using DeepSpeed.
     use_8bit_adam = bool(args.use_8bit_adam)
-    if accelerator.distributed_type == DistributedType.DEEPSPEED and use_8bit_adam:
-        logger.warning("DeepSpeed is enabled; disabling bitsandbytes 8-bit Adam for compatibility.")
-        use_8bit_adam = False
+    # if accelerator.distributed_type == DistributedType.DEEPSPEED and use_8bit_adam:
+    #     # 跑不通就取消注释这个
+    #     logger.warning("DeepSpeed is enabled; disabling bitsandbytes 8-bit Adam for compatibility.")
+    #     use_8bit_adam = False
 
     if use_8bit_adam:
         try:
@@ -420,11 +421,14 @@ def main():
     )
 
     if accelerator.distributed_type == DistributedType.DEEPSPEED:
-        # DeepSpeed expects a single engine: wrap SR bundle + its optimizer/dataloader/scheduler together.
+        # DeepSpeed supports a single engine per Accelerator instance.
+        # Wrap only SR bundle + its optimizer/dataloader/scheduler.
         sr_bundle, optimizer_sr, train_dataloader, lr_scheduler_sr = accelerator.prepare(
             sr_bundle, optimizer_sr, train_dataloader, lr_scheduler_sr
         )
-        # Keep discriminator outside DeepSpeed (single-process training). This avoids multiple DS engines.
+        # Keep discriminator outside DeepSpeed to avoid a second engine.
+        # (This code path is intended for num_processes=1. For multi-GPU GAN training,
+        # prefer DDP over DeepSpeed or refactor to a single-engine design.)
     else:
         sr_bundle, optimizer_sr, train_dataloader, lr_scheduler_sr = accelerator.prepare(
             sr_bundle, optimizer_sr, train_dataloader, lr_scheduler_sr
@@ -573,17 +577,26 @@ def main():
                 # Fake images
                 loss_D_fake = net_disc(fake_img, for_real=False) * args.lambda_GAN 
                 # Real images
+                hq_img = hq_img.to(fake_img.dtype)
                 loss_D_real = net_disc(hq_img, for_real=True) * args.lambda_GAN 
           
                 total_D_loss = loss_D_real + loss_D_fake 
 
-                accelerator.backward(total_D_loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(disc_opt, args.max_grad_norm)
-
-                optimizer_disc.step()
-                lr_scheduler_disc.step()
-                optimizer_disc.zero_grad()
+                if accelerator.distributed_type == DistributedType.DEEPSPEED:
+                    # Do NOT use accelerator.backward() here: it is tied to the SR DeepSpeed engine.
+                    total_D_loss.backward()
+                    if accelerator.sync_gradients:
+                        torch.nn.utils.clip_grad_norm_(disc_opt, args.max_grad_norm)
+                        optimizer_disc.step()
+                        lr_scheduler_disc.step()
+                        optimizer_disc.zero_grad()
+                else:
+                    accelerator.backward(total_D_loss)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(disc_opt, args.max_grad_norm)
+                    optimizer_disc.step()
+                    lr_scheduler_disc.step()
+                    optimizer_disc.zero_grad()
             
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
