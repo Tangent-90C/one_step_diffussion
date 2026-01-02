@@ -34,7 +34,7 @@ def main(args):
         guidance_scale=args.guidance_scale, mid_timestep=args.mid_timestep)
 
     text_encoding_pipeline = FluxPipeline.from_pretrained(
-        args.flux_path, transformer=None, vae=None, torch_dtype=args.weight_dtype
+        args.flux_path, transformer=None, vae=None, dtype=args.weight_dtype
     )
     text_encoding_pipeline = text_encoding_pipeline.to("cuda")
     with torch.no_grad():
