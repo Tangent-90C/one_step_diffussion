@@ -15,10 +15,10 @@ lambda_L1: 0.5
 lambda_GAN: 0.5
 mid_timestep: 244 
 
-output_dir: ./omgsr_trainings/omgsr_sana_1024
+output_dir: ./omgsr_trainings/omgsr_sana_1024_rain2
 resolution: 1024
 train_batch_size: 1
-max_train_steps: 6000
+max_train_steps: 12000
 checkpointing_steps: 100
 save_img_steps: 50
 resume_from_checkpoint: null
@@ -31,7 +31,7 @@ lr_warmup_steps: 500
 lr_num_cycles: 1
 lr_power: 1.0
 dataloader_num_workers: 4
-use_8bit_adam: True
+use_8bit_adam: False
 adam_beta1: 0.9
 adam_beta2: 0.999
 adam_weight_decay: 1e-4

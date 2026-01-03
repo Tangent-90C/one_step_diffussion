@@ -1,6 +1,7 @@
 *.pyc
 __pycache__/
 experiments_omgsr_f/*
+experiments_omgsr_sana_rain/*
 omgsr_trainings/*
 .venv/
 .vscode/
