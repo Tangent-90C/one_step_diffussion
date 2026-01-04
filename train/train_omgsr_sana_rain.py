@@ -12,46 +12,48 @@
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
-import sys
-import argparse
-import logging
-import math
 import os
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
-
-from pathlib import Path
-from typing import Callable
-import omegaconf
-from omegaconf import OmegaConf
-import torch
-import transformers
-from accelerate import Accelerator, DistributedType
-from accelerate.logging import get_logger
+import copy
+from peft import LoraConfig, PeftModel
+from diffusers.utils.import_utils import is_xformers_available
+from dataset.my_dataset import PairedDataset, CSVPairsDataset
+import warnings
+import torch.nn.functional as F
+from diffusers.utils.torch_utils import is_compiled_module
+from diffusers.training_utils import (
+    free_memory,
+)
+from diffusers.optimization import get_scheduler
+from diffusers import (
+    AutoencoderDC, SanaPipeline, SanaTransformer2DModel
+)
+import diffusers
+from torchvision.utils import save_image
+from tqdm.auto import tqdm
 from accelerate.utils import (
     ProjectConfiguration,
     set_seed,
 )
-from tqdm.auto import tqdm
-from torchvision.utils import save_image
-import diffusers
-from diffusers import (
-    AutoencoderDC, SanaPipeline, SanaTransformer2DModel
-)
-from diffusers.optimization import get_scheduler
-from diffusers.training_utils import (
-    free_memory,
-)
-from diffusers.utils.torch_utils import is_compiled_module
-import torch.nn.functional as F
-import warnings
+from accelerate.logging import get_logger
+from accelerate import Accelerator, DistributedType
+import transformers
+import torch
+from omegaconf import OmegaConf
+import omegaconf
+from typing import Callable
+from pathlib import Path
+import sys
+import argparse
+import logging
+import math
+
+
+
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.dirname(SCRIPT_DIR))
-from dataset.my_dataset import PairedDataset, CSVPairsDataset
-from diffusers.utils.import_utils import is_xformers_available
-from peft import LoraConfig, PeftModel
-import copy
 
 
 class SRBundle(torch.nn.Module):
@@ -63,10 +65,12 @@ class SRBundle(torch.nn.Module):
     def forward(self, *args, **kwargs):
         return self.sana_transformer(*args, **kwargs)
 
+
 # Monkeypatch to fix TypeError: SanaCombinedTimestepGuidanceEmbeddings.forward() got an unexpected keyword argument 'batch_size'
 try:
     from diffusers.models.transformers.sana_transformer import SanaCombinedTimestepGuidanceEmbeddings
     original_forward = SanaCombinedTimestepGuidanceEmbeddings.forward
+
     def new_forward(self, timestep, guidance=None, hidden_dtype=None, **kwargs):
         return original_forward(self, timestep, guidance, hidden_dtype)
     SanaCombinedTimestepGuidanceEmbeddings.forward = new_forward
@@ -77,6 +81,7 @@ warnings.filterwarnings("ignore")
 
 logger = get_logger(__name__)
 
+
 def encode_images(pixels: torch.Tensor, vae: torch.nn.Module, weight_dtype):
     encoded = vae.encode(pixels.to(vae.dtype))
     if hasattr(encoded, "latent_dist"):
@@ -84,15 +89,18 @@ def encode_images(pixels: torch.Tensor, vae: torch.nn.Module, weight_dtype):
     elif hasattr(encoded, "latent"):
         pixel_latents = encoded.latent
     else:
-        raise AttributeError("EncoderOutput has neither latent_dist nor latent")
-    
+        raise AttributeError(
+            "EncoderOutput has neither latent_dist nor latent")
+
     shift_factor = getattr(vae.config, "shift_factor", 0.0)
     scaling_factor = getattr(vae.config, "scaling_factor", 1.0)
     pixel_latents = (pixel_latents - shift_factor) * scaling_factor
     return pixel_latents.to(weight_dtype)
 
+
 def time_shift(mu: float, sigma: float, t: torch.Tensor):
     return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma)
+
 
 def get_lin_function(
     x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: float = 1.15
@@ -100,6 +108,7 @@ def get_lin_function(
     m = (y2 - y1) / (x2 - x1)
     b = y1 - m * x1
     return lambda x: m * x + b
+
 
 def get_schedule(
     num_steps: int,
@@ -119,6 +128,7 @@ def get_schedule(
 
     return timesteps.tolist()
 
+
 def get_sana_setting_timesteps(n=999, resolution=1024):
     # Sana latent size is resolution / 32
     latent_size = resolution // 32
@@ -127,6 +137,7 @@ def get_sana_setting_timesteps(n=999, resolution=1024):
         latent_size * latent_size,
         shift=True,
     )
+
 
 def set_vae_encoder_lora(vae_encoder, rank):
     # Adjust target modules for AutoencoderDC if needed
@@ -144,7 +155,7 @@ def set_vae_encoder_lora(vae_encoder, rank):
     #     "to_out.0",
     #     # "GLUMBConv"
     # ]
-    
+
     target_modules = r"(^conv_in$|^conv_out$|.*\.conv1$|.*\.conv2$|.*\.conv_shortcut$|.*\.conv$|.*\.to_k$|.*\.to_q$|.*\.to_v$|.*\.to_out$|.*\.conv_inverted$|.*\.conv_point$)"
 
     # Filter target modules that actually exist in the model
@@ -159,13 +170,11 @@ def set_vae_encoder_lora(vae_encoder, rank):
         target_modules=target_modules,
         init_lora_weights="gaussian",
     )
-    
-    vae_encoder = PeftModel(vae_encoder, vae_encoder_lora_config, adapter_name="vae_encoder_adapter")
+
+    vae_encoder = PeftModel(
+        vae_encoder, vae_encoder_lora_config, adapter_name="vae_encoder_adapter")
     vae_encoder.print_trainable_parameters()
     return vae_encoder
-
-
-
 
 
 def set_sana_transformer_lora(sana_transformer, rank):
@@ -177,9 +186,9 @@ def set_sana_transformer_lora(sana_transformer, rank):
     #     "ff.net.0.proj",
     #     "ff.net.2",
     # ]
- 
+
     target_modules = ["to_k", "to_q", "to_v"]
-    
+
     transformer_lora_config = LoraConfig(
         r=rank,
         lora_alpha=rank,
@@ -187,12 +196,15 @@ def set_sana_transformer_lora(sana_transformer, rank):
         init_lora_weights="gaussian",
     )
     # print(get_peft_model_state_dict(sana_transformer))
-    sana_transformer = PeftModel(sana_transformer, transformer_lora_config, adapter_name="sana_adapter")
+    sana_transformer = PeftModel(
+        sana_transformer, transformer_lora_config, adapter_name="sana_adapter")
     sana_transformer.print_trainable_parameters()
     return sana_transformer
 
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    parser = argparse.ArgumentParser(
+        description="Simple example of a training script.")
     parser.add_argument(
         "--config",
         type=str,
@@ -207,7 +219,7 @@ def parse_args():
 def main():
     args = OmegaConf.load(parse_args())
     logging_dir = Path(args.output_dir, args.logging_dir)
-    
+
     accelerator_project_config = ProjectConfiguration(
         project_dir=args.output_dir, logging_dir=logging_dir
     )
@@ -262,11 +274,13 @@ def main():
             prompt_embeds, prompt_attention_mask, _, _ = text_encoding_pipeline.encode_prompt(
                 args.fixed_prompt
             )
-        text_encoding_pipeline = text_encoding_pipeline.to("cpu")  # Move to CPU first
+        text_encoding_pipeline = text_encoding_pipeline.to(
+            "cpu")  # Move to CPU first
         del text_encoding_pipeline
         free_memory()
     else:
-        prompts = torch.load(args.fixed_prompt_path, weights_only=True, map_location=accelerator.device)
+        prompts = torch.load(args.fixed_prompt_path,
+                             weights_only=True, map_location=accelerator.device)
         prompt_embeds = prompts["prompt_embeds"]
         prompt_attention_mask = prompts.get("prompt_attention_mask", None)
 
@@ -277,7 +291,8 @@ def main():
 
     # fixed vae
     # Sana uses AutoencoderDC
-    fixed_vae = AutoencoderDC.from_pretrained(args.model_path, subfolder="vae", torch_dtype=weight_dtype)
+    fixed_vae = AutoencoderDC.from_pretrained(
+        args.model_path, subfolder="vae", torch_dtype=weight_dtype)
     fixed_vae.requires_grad_(False)
     fixed_vae.eval()
 
@@ -290,13 +305,16 @@ def main():
     if hasattr(lora_vae, "decoder"):
         del lora_vae.decoder
     free_memory()
-    lora_vae.encoder = set_vae_encoder_lora(lora_vae.encoder, args.vae_lora_rank)
+    lora_vae.encoder = set_vae_encoder_lora(
+        lora_vae.encoder, args.vae_lora_rank)
     lora_vae.train()
 
     # sana_transformer
-    sana_transformer = SanaTransformer2DModel.from_pretrained(args.model_path, subfolder="transformer", torch_dtype=weight_dtype)    
+    sana_transformer = SanaTransformer2DModel.from_pretrained(
+        args.model_path, subfolder="transformer", torch_dtype=weight_dtype)
     sana_transformer.requires_grad_(False)
-    sana_transformer = set_sana_transformer_lora(sana_transformer, args.transformer_lora_rank)
+    sana_transformer = set_sana_transformer_lora(
+        sana_transformer, args.transformer_lora_rank)
     sana_transformer.train()
 
     # Bundle SR trainable parts into a single module for DeepSpeed.
@@ -310,16 +328,18 @@ def main():
             raise ValueError(
                 "xformers is not available, please install it by running `pip install xformers`"
             )
-    
+
     # DINOv3-ConvNeXt DISTS Loss
     from dinov3_gan.dinov3_convnext_dists import DINOv3ConvNeXtDISTS
-    net_dv3d = DINOv3ConvNeXtDISTS(dinov3_convnext_size=args.dinov3_convnext_size)
+    net_dv3d = DINOv3ConvNeXtDISTS(
+        dinov3_convnext_size=args.dinov3_convnext_size)
 
     # DINOv3-ConvNeXt Discrminator
     from dinov3_gan.dinov3_convnext_disc import Dinov3ConvNeXtDiscriminator
-    net_disc = Dinov3ConvNeXtDiscriminator(dinov3_convnext_size=args.dinov3_convnext_size, resolution=args.resolution)
+    net_disc = Dinov3ConvNeXtDiscriminator(
+        dinov3_convnext_size=args.dinov3_convnext_size, resolution=args.resolution)
 
-    fixed_vae.to(device=accelerator.device)  
+    fixed_vae.to(device=accelerator.device)
     sr_bundle.to(device=accelerator.device)
     net_dv3d.to(device=accelerator.device)
     net_disc.to(device=accelerator.device)
@@ -353,10 +373,6 @@ def main():
     # bitsandbytes 8-bit optimizers frequently conflict with DeepSpeed ZeRO optimizers.
     # Prefer regular AdamW when using DeepSpeed.
     use_8bit_adam = bool(args.use_8bit_adam)
-    # if accelerator.distributed_type == DistributedType.DEEPSPEED and use_8bit_adam:
-    #     # 跑不通就取消注释这个
-    #     logger.warning("DeepSpeed is enabled; disabling bitsandbytes 8-bit Adam for compatibility.")
-    #     use_8bit_adam = False
 
     if use_8bit_adam:
         try:
@@ -389,13 +405,16 @@ def main():
     # For de-raining on GT-Rain: if user provides a single CSV file (clean,rainy),
     # use it and return (rainy, clean) as (lq_img, hq_img).
     if (
-        isinstance(args.dataset_txt_or_dir_paths, (list, tuple, omegaconf.listconfig.ListConfig))
+        isinstance(args.dataset_txt_or_dir_paths,
+                   (list, tuple, omegaconf.listconfig.ListConfig))
         and len(args.dataset_txt_or_dir_paths) == 1
         and str(args.dataset_txt_or_dir_paths[0]).lower().endswith(".csv")
     ):
-        train_dataset = CSVPairsDataset(args.dataset_txt_or_dir_paths[0], args.resolution)
+        train_dataset = CSVPairsDataset(
+            args.dataset_txt_or_dir_paths[0], args.resolution)
     else:
-        train_dataset = PairedDataset(args.dataset_txt_or_dir_paths, args.resolution)
+        train_dataset = PairedDataset(
+            args.dataset_txt_or_dir_paths, args.resolution)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
@@ -457,7 +476,8 @@ def main():
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+    args.num_train_epochs = math.ceil(
+        args.max_train_steps / num_update_steps_per_epoch)
 
     # Train!
     total_batch_size = (
@@ -470,11 +490,13 @@ def main():
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(
+        f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(
         f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
     )
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(
+        f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
     first_epoch = 0
@@ -521,14 +543,14 @@ def main():
 
     def one_mid_timestep_pred(lq_latent):
         bsz, c, h, w = lq_latent.shape
-        
+
         guidance_vec = torch.full(
             (bsz,), 5.0, device=lq_latent.device, dtype=lq_latent.dtype
         )
 
         # Sana forward arguments:
         # hidden_states, encoder_hidden_states, timestep, encoder_attention_mask
-        
+
         model_pred = sr_module.sana_transformer(
             hidden_states=lq_latent,
             encoder_hidden_states=prompt_embeds,
@@ -538,12 +560,13 @@ def main():
             return_dict=False,
         )[0]
 
-        lq_latent = lq_latent - sigma_t * model_pred  
-        
+        lq_latent = lq_latent - sigma_t * model_pred
+
         lq_latent = (lq_latent / scaling_factor) + shift_factor
-        pred_img = fixed_vae.decode(lq_latent.to(fixed_vae.dtype), return_dict=False)[0]
+        pred_img = fixed_vae.decode(lq_latent.to(
+            fixed_vae.dtype), return_dict=False)[0]
         return pred_img
-    
+
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(sr_bundle):
@@ -554,25 +577,29 @@ def main():
 
                 hq_latent = encode_images(hq_img, fixed_vae, weight_dtype)
                 noise = torch.randn_like(hq_latent)
-                pretrained_noisy_latent = (1 - sigma_t) * hq_latent + sigma_t * noise  
+                pretrained_noisy_latent = (
+                    1 - sigma_t) * hq_latent + sigma_t * noise
 
-                lq_latent = encode_images(lq_img, sr_module.lora_vae, weight_dtype)
+                lq_latent = encode_images(
+                    lq_img, sr_module.lora_vae, weight_dtype)
 
                 # LRR Loss: Latent Representation Refinement Loss
-                loss_LRR = F.mse_loss(pretrained_noisy_latent, lq_latent, reduction="mean") * args.lambda_LRR
-                
+                loss_LRR = F.mse_loss(
+                    pretrained_noisy_latent, lq_latent, reduction="mean") * args.lambda_LRR
+
                 # Onestep prediction at mid-timestep
                 pred_img = one_mid_timestep_pred(lq_latent)
 
-                # DINOv3-ConvNext DISTS Loss 
+                # DINOv3-ConvNext DISTS Loss
                 loss_Dv3D = net_dv3d(pred_img, hq_img) * args.lambda_Dv3D
 
                 # L1 Loss
-                loss_L1 = F.l1_loss(pred_img, hq_img, reduction="mean") * args.lambda_L1
+                loss_L1 = F.l1_loss(
+                    pred_img, hq_img, reduction="mean") * args.lambda_L1
 
                 # Generator Loss (FLUX/SANA)
                 loss_G = net_disc(pred_img, for_G=True) * args.lambda_GAN
-                
+
                 total_G_loss = loss_LRR + loss_Dv3D + loss_L1 + loss_G
 
                 accelerator.backward(total_G_loss)
@@ -582,40 +609,45 @@ def main():
                 optimizer_sr.step()
                 lr_scheduler_sr.step()
                 optimizer_sr.zero_grad()
-                
+
                 fake_img = pred_img.detach()
                 # Fake images
-                loss_D_fake = net_disc(fake_img, for_real=False) * args.lambda_GAN 
+                loss_D_fake = net_disc(
+                    fake_img, for_real=False) * args.lambda_GAN
                 # Real images
                 hq_img = hq_img.to(fake_img.dtype)
-                loss_D_real = net_disc(hq_img, for_real=True) * args.lambda_GAN 
-          
-                total_D_loss = loss_D_real + loss_D_fake 
+                loss_D_real = net_disc(hq_img, for_real=True) * args.lambda_GAN
+
+                total_D_loss = loss_D_real + loss_D_fake
 
                 if accelerator.distributed_type == DistributedType.DEEPSPEED:
                     # Do NOT use accelerator.backward() here: it is tied to the SR DeepSpeed engine.
                     total_D_loss.backward()
                     if accelerator.sync_gradients:
-                        torch.nn.utils.clip_grad_norm_(disc_opt, args.max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(
+                            disc_opt, args.max_grad_norm)
                         optimizer_disc.step()
                         lr_scheduler_disc.step()
                         optimizer_disc.zero_grad()
                 else:
                     accelerator.backward(total_D_loss)
                     if accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(disc_opt, args.max_grad_norm)
+                        accelerator.clip_grad_norm_(
+                            disc_opt, args.max_grad_norm)
                     optimizer_disc.step()
                     lr_scheduler_disc.step()
                     optimizer_disc.zero_grad()
-            
+
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 if (
                     accelerator.is_main_process
                     and global_step % args.save_img_steps == 0
                 ):
-                    img_path = os.path.join(args.output_dir, f"img-{global_step}.png")
-                    save_imgs = (torch.stack([lq_img[0], pred_img[0], hq_img[0]], dim=0) + 1) / 2
+                    img_path = os.path.join(
+                        args.output_dir, f"img-{global_step}.png")
+                    save_imgs = (torch.stack(
+                        [lq_img[0], pred_img[0], hq_img[0]], dim=0) + 1) / 2
                     save_image(save_imgs.detach(), img_path)
                     logger.info(f"img-{global_step}.png saved!")
 

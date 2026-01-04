@@ -22,6 +22,7 @@ from typing import Callable
 from omegaconf import OmegaConf
 import torch
 import transformers
+import accelerate
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
 from accelerate.utils import (
