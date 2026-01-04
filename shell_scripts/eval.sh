@@ -1,0 +1,1 @@
+python eval/evaluate.py  --recon_dir /home/chenjn/OMGSR/experiments_omgsr_sana_rain/test --pairs_csv /home/chenjn/OMGSR/gtrain_pairs_test.csv

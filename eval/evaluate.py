@@ -193,7 +193,27 @@ def eval_batch(
             update_patch_fid(gt_p, recon_p, fid_metric=fid_metric, kid_metric=kid_metric, patch_size=patch_size)
 
         for key, metric in metric_paired_dict.items():
-            value = metric(recon_batch, gt_batch)
+            recon_in = recon_batch
+            gt_in = gt_batch
+
+            # Some metrics (notably MS-SSIM) require a minimum spatial size.
+            # pyiqa's ms_ssim uses an 11x11 window across multiple scales; pad to a safe size.
+            if key == "ms_ssim":
+                ms_ssim_min_size = 176  # 11 * 2**4 for 5-scale MS-SSIM
+                gt_in = _pad_to_min_size(gt_in, min_size=ms_ssim_min_size)
+                recon_in = _pad_to_min_size(recon_in, min_size=ms_ssim_min_size)
+
+            try:
+                value = metric(recon_in, gt_in)
+            except RuntimeError as e:
+                # Fallback for unexpected small-size cases: pad and retry once.
+                msg = str(e)
+                if key == "ms_ssim" and ("Kernel size can't be greater than actual input size" in msg or "Kernel size" in msg):
+                    gt_in = _pad_to_min_size(gt_batch, min_size=176)
+                    recon_in = _pad_to_min_size(recon_batch, min_size=176)
+                    value = metric(recon_in, gt_in)
+                else:
+                    raise
             result[key] = result.get(key, 0.0) + _sum_metric_output(value)
 
     return result, batch_n
