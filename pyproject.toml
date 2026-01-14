@@ -17,6 +17,7 @@ dependencies = [
     "scikit-image>=0.26.0",
     "scipy>=1.16.3",
     "transformers>=4.57.3",
+    "wandb>=0.23.1",
 ]
 
 [project.optional-dependencies]

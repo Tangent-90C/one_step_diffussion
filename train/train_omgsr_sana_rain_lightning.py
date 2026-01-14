@@ -2,6 +2,12 @@
 # coding=utf-8
 
 import os
+import sys
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+if REPO_ROOT not in sys.path:
+    sys.path.append(REPO_ROOT)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -20,6 +26,7 @@ import omegaconf
 from omegaconf import OmegaConf
 from torchvision.utils import save_image
 from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
 import torch.nn.functional as F
 import torch
 from typing import Callable, Optional
@@ -28,12 +35,7 @@ import logging
 import argparse
 import math
 import copy
-import sys
-
-
-
-SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-sys.path.append(os.path.dirname(SCRIPT_DIR))
+ 
 
 
 # DINOv3 losses/disc
@@ -177,6 +179,24 @@ class SanaRainDataModule(pl.LightningDataModule):
         )
 
 
+class _SyntheticPairsDataset(Dataset):
+    def __init__(self, resolution: int, length: int = 1):
+        super().__init__()
+        self.resolution = int(resolution)
+        self.length = int(length)
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        # Match training code expectations: tensors in [-1, 1]
+        h = self.resolution
+        w = self.resolution
+        lq = torch.rand(3, h, w) * 2 - 1
+        hq = torch.rand(3, h, w) * 2 - 1
+        return lq, hq
+
+
 class OMGSR_SanaRain_Lightning(pl.LightningModule):
     def __init__(self, args):
         super().__init__()
@@ -310,6 +330,28 @@ class OMGSR_SanaRain_Lightning(pl.LightningModule):
 
         if bool(self.args.allow_tf32) and torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = True
+
+        # Memory profiling flags
+        self._profile_memory = bool(getattr(self.args, "profile_memory", False))
+        self._mem_profile_armed = False
+
+    def on_train_batch_start(self, batch, batch_idx: int) -> None:
+        if not self._profile_memory:
+            return
+        if torch.cuda.is_available() and self.trainer.is_global_zero and not self._mem_profile_armed:
+            torch.cuda.reset_peak_memory_stats()
+            self._mem_profile_armed = True
+
+    def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
+        if not self._profile_memory:
+            return
+        if torch.cuda.is_available() and self.trainer.is_global_zero and self._mem_profile_armed:
+            alloc = torch.cuda.max_memory_allocated()
+            reserv = torch.cuda.max_memory_reserved()
+            logger.info(
+                f"[VRAM] peak allocated={alloc/1024**3:.2f} GB, peak reserved={reserv/1024**3:.2f} GB"
+            )
+            self._mem_profile_armed = False
 
     def one_mid_timestep_pred(self, lq_latent: torch.Tensor) -> torch.Tensor:
         bsz, _, _, _ = lq_latent.shape
@@ -540,12 +582,60 @@ def parse_args():
         default="./configs/omgsr_sana_1024_rain.yml",
         help="path to config",
     )
-    ns = parser.parse_args()
-    return ns.config
+    parser.add_argument(
+        "--dry_run_steps",
+        type=int,
+        default=None,
+        help="If set, run only this many optimizer steps (approx).",
+    )
+    parser.add_argument(
+        "--profile_memory",
+        action="store_true",
+        help="Print CUDA peak memory after a full forward+backward.",
+    )
+    parser.add_argument(
+        "--no_wandb",
+        action="store_true",
+        help="Disable WandB logging (useful for profiling).",
+    )
+    parser.add_argument(
+        "--accelerator",
+        type=str,
+        default=None,
+        choices=["cpu", "gpu", "auto"],
+        help="Override Trainer accelerator.",
+    )
+    parser.add_argument(
+        "--devices",
+        type=int,
+        default=None,
+        help="Override Trainer devices.",
+    )
+    parser.add_argument(
+        "--synthetic_batch",
+        action="store_true",
+        help="Use a synthetic random batch (no dataset I/O).",
+    )
+    return parser.parse_args()
 
 
 def main():
-    args = OmegaConf.load(parse_args())
+    cli = parse_args()
+    args = OmegaConf.load(cli.config)
+
+    # Merge CLI overrides into config (keep config as the single source of truth).
+    if cli.dry_run_steps is not None:
+        args.max_train_steps = int(cli.dry_run_steps)
+    if bool(cli.profile_memory):
+        args.profile_memory = True
+    if bool(cli.no_wandb):
+        args.no_wandb = True
+    if cli.accelerator is not None:
+        args.trainer_accelerator = str(cli.accelerator)
+    if cli.devices is not None:
+        args.trainer_devices = int(cli.devices)
+    if bool(cli.synthetic_batch):
+        args.synthetic_batch = True
 
     os.makedirs(args.output_dir, exist_ok=True)
     OmegaConf.save(args, os.path.join(args.output_dir, "cfg.yml"))
@@ -558,24 +648,42 @@ def main():
     if args.seed is not None:
         pl.seed_everything(int(args.seed), workers=True)
 
-    datamodule = SanaRainDataModule(
-        dataset_txt_or_dir_paths=args.dataset_txt_or_dir_paths,
-        resolution=args.resolution,
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
-    )
+    if bool(getattr(args, "synthetic_batch", False)):
+        synthetic_ds = _SyntheticPairsDataset(int(args.resolution), length=1)
+
+        class _SyntheticDM(pl.LightningDataModule):
+            def train_dataloader(self_nonlocal):
+                return DataLoader(
+                    synthetic_ds,
+                    batch_size=int(args.train_batch_size),
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=torch.cuda.is_available(),
+                )
+
+        datamodule = _SyntheticDM()
+    else:
+        datamodule = SanaRainDataModule(
+            dataset_txt_or_dir_paths=args.dataset_txt_or_dir_paths,
+            resolution=args.resolution,
+            batch_size=args.train_batch_size,
+            num_workers=args.dataloader_num_workers,
+        )
 
     model = OMGSR_SanaRain_Lightning(args)
 
-    wandb_logger = WandbLogger(
-        project=str(getattr(args, "wandb_project", "omgsr")),
-        name=str(getattr(args, "wandb_name", Path(args.output_dir).name)),
-        save_dir=str(Path(args.output_dir)),
-    )
-    # Record the full resolved config for reproducibility.
-    wandb_logger.experiment.config.update(
-        OmegaConf.to_container(args, resolve=True), allow_val_change=True
-    )
+    if bool(getattr(args, "no_wandb", False)):
+        wandb_logger = None
+    else:
+        wandb_logger = WandbLogger(
+            project=str(getattr(args, "wandb_project", "omgsr")),
+            name=str(getattr(args, "wandb_name", Path(args.output_dir).name)),
+            save_dir=str(Path(args.output_dir)),
+        )
+        # Record the full resolved config for reproducibility.
+        wandb_logger.experiment.config.update(
+            OmegaConf.to_container(args, resolve=True), allow_val_change=True
+        )
 
     precision = "32-true"
     mp = str(getattr(args, "mixed_precision", "no")).lower()
@@ -583,6 +691,12 @@ def main():
         precision = "bf16-mixed"
     elif mp in {"fp16", "16", "16-mixed"}:
         precision = "16-mixed"
+
+    # Trainer device selection
+    accelerator = str(getattr(args, "trainer_accelerator", "auto")).lower()
+    if accelerator == "auto":
+        accelerator = "gpu" if torch.cuda.is_available() else "cpu"
+    devices = int(getattr(args, "trainer_devices", 1))
 
     trainer = pl.Trainer(
         default_root_dir=str(args.output_dir),
@@ -593,10 +707,11 @@ def main():
         precision=precision,
         log_every_n_steps=1,
         enable_checkpointing=False,
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=1,
+        accelerator=accelerator,
+        devices=devices,
         num_nodes=1,
         plugins=[LightningEnvironment()],
+        limit_train_batches=1 if int(args.max_train_steps) <= 1 else 1.0,
     )
 
     trainer.fit(model, datamodule=datamodule)
