@@ -464,12 +464,30 @@ class OMGSR_SanaRain_Lightning(pl.LightningModule):
             (bsz,), 5.0, device=lq_latent.device, dtype=lq_latent.dtype
         )
 
+        prompt_embeds = self._prompt_embeds
+        if prompt_embeds.shape[0] != bsz:
+            if prompt_embeds.shape[0] == 1:
+                prompt_embeds = prompt_embeds.repeat(bsz, 1, 1)
+            else:
+                prompt_embeds = prompt_embeds[:bsz]
+        prompt_embeds = prompt_embeds.to(device=lq_latent.device, dtype=lq_latent.dtype)
+
+        prompt_attention_mask = getattr(self, "_prompt_attention_mask", None)
+        if prompt_attention_mask is not None:
+            if prompt_attention_mask.dim() == 1:
+                prompt_attention_mask = prompt_attention_mask.unsqueeze(0)
+            if prompt_attention_mask.shape[0] != bsz:
+                if prompt_attention_mask.shape[0] == 1:
+                    prompt_attention_mask = prompt_attention_mask.repeat(bsz, 1)
+                else:
+                    prompt_attention_mask = prompt_attention_mask[:bsz]
+            prompt_attention_mask = prompt_attention_mask.to(device=lq_latent.device)
+
         model_pred = self.sana_transformer(
             hidden_states=lq_latent,
-            encoder_hidden_states=self._prompt_embeds,
-            timestep=torch.tensor([self.sigma_t], device=lq_latent.device),
-            encoder_attention_mask=getattr(
-                self, "_prompt_attention_mask", None),
+            encoder_hidden_states=prompt_embeds,
+            timestep=torch.full((bsz,), self.sigma_t, device=lq_latent.device, dtype=lq_latent.dtype),
+            encoder_attention_mask=prompt_attention_mask,
             guidance=guidance_vec,
             return_dict=False,
         )[0]
