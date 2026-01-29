@@ -4,6 +4,14 @@ model_path: /mnt/HDD-data/jianuo/models/Sana_Sprint_1.6B_1024px_diffusers
 fixed_prompt: ""   # empty prompt is ok!
 fixed_prompt_path: null
 dataset_txt_or_dir_paths: ['/home/chenjn/OMGSR/gtrain_pairs.csv']
+val_dataset_txt_or_dir_paths: ['/home/chenjn/OMGSR/gtrain_pairs_val.csv']
+val_batch_size: 1
+val_check_interval: 500
+val_sample_enabled: True
+val_sample_ratio: 1
+val_sample_max: 500
+val_sample_seed: 123
+val_log_num_images: 8
 
 vae_lora_rank: 64
 transformer_lora_rank: 64
@@ -19,8 +27,9 @@ output_dir: ./omgsr_trainings/omgsr_sana_1024_rain2
 resolution: 512
 train_batch_size: 1
 max_train_steps: 12000
-checkpointing_steps: 100
+checkpointing_steps: 500
 save_img_steps: 50
+save_img_to_wandb: True
 resume_from_checkpoint: null
 gradient_accumulation_steps: 4
 gradient_checkpointing: True

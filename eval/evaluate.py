@@ -2,8 +2,8 @@ import sys
 import os
 import argparse
 import csv
+import random
 import tqdm
-import pyiqa
 import torch
 import torch.nn.functional as F
 from pathlib import Path
@@ -14,13 +14,18 @@ from torchmetrics.image.kid import KernelInceptionDistance
 
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
+try:
+    # When imported as a package module (e.g. in tests)
+    from .metrics import DISTS, MSSSIM, PSNR
+except ImportError:  # pragma: no cover
+    # When executed as a script: `python eval/evaluate.py ...`
+    from metrics import DISTS, MSSSIM, PSNR
+
 # Local reimplementation (removes neuralcompression dependency)
 _eval_dir = os.path.dirname(os.path.abspath(__file__))
 if _eval_dir not in sys.path:
     sys.path.insert(0, _eval_dir)
 from patch_fid import update_patch_fid
-
-os.environ['HF_HOME'] = '/mnt/HDD-data/jianuo/cache'
 
 
 class _SkimageSSIM:
@@ -197,7 +202,7 @@ def eval_batch(
             gt_in = gt_batch
 
             # Some metrics (notably MS-SSIM) require a minimum spatial size.
-            # pyiqa's ms_ssim uses an 11x11 window across multiple scales; pad to a safe size.
+            # MS-SSIM uses an 11x11 window across multiple scales; pad to a safe size.
             if key == "ms_ssim":
                 ms_ssim_min_size = 176  # 11 * 2**4 for 5-scale MS-SSIM
                 gt_in = _pad_to_min_size(gt_in, min_size=ms_ssim_min_size)
@@ -220,16 +225,28 @@ def eval_batch(
 
 
 
-def evaluate(recon_dir, gt_dir, ntest, pairs_csv: str | Path | None = None):
+def _set_seed(seed: int) -> None:
+    try:
+        import numpy as np
+    except Exception:  # pragma: no cover
+        np = None
+
+    random.seed(seed)
+    if np is not None:
+        np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def evaluate(recon_dir, gt_dir, ntest, pairs_csv: str | Path | None = None, seed: int | None = None):
+    if seed is not None:
+        _set_seed(int(seed))
 
     device = torch.device("cuda")
     totensor = ToTensor()
 
     metric_dict = {}
-    # metric_dict["clipiqa"] = pyiqa.create_metric('clipiqa').to(device)
-    # metric_dict["musiq"] = pyiqa.create_metric('musiq').to(device)
-    # metric_dict["niqe"] = pyiqa.create_metric('niqe').to(device)
-    # metric_dict["maniqa"] = pyiqa.create_metric('maniqa').to(device)
     metric_paired_dict = {}
     recon_dir = Path(recon_dir) if not isinstance(recon_dir, Path) else recon_dir
     assert recon_dir.is_dir()
@@ -311,9 +328,9 @@ def evaluate(recon_dir, gt_dir, ntest, pairs_csv: str | Path | None = None):
     # Initialize paired metrics if GT exists (either via gt_dir or pairs_csv).
     has_gt = any(gt is not None for _, gt in eval_pairs)
     if has_gt:
-        metric_paired_dict["psnr"] = pyiqa.create_metric('psnr').to(device)
-        metric_paired_dict["dists"] = pyiqa.create_metric('dists').to(device)
-        metric_paired_dict["ms_ssim"] = pyiqa.create_metric('ms_ssim').to(device)
+        metric_paired_dict["psnr"] = PSNR(data_range=1.0).to(device)
+        metric_paired_dict["dists"] = DISTS().to(device)
+        metric_paired_dict["ms_ssim"] = MSSSIM(data_range=1.0).to(device)
         metric_paired_dict["ssim"] = _SkimageSSIM()
         metric_paired_dict["lpips"] = LearnedPerceptualImagePatchSimilarity(normalize=True).to(device)  # lpips-alexnet
         fid_metric = FrechetInceptionDistance().to(device)
@@ -394,13 +411,19 @@ def parse_args(argv):
         default=None,
         help="Optional CSV defining clean/rainy pairing (e.g. gtrain_pairs_val.csv). If set, pairs are taken from CSV (rainy->clean).",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional RNG seed for reproducible stochastic metrics (notably KID).",
+    )
     args = parser.parse_args(argv)
     return args
 
 
 def main(argv):
     args = parse_args(argv)
-    print_results = evaluate(args.recon_dir, args.gt_dir, None, pairs_csv=args.pairs_csv)
+    print_results = evaluate(args.recon_dir, args.gt_dir, None, pairs_csv=args.pairs_csv, seed=args.seed)
 
 if __name__ == "__main__":
     main(sys.argv[1:])

@@ -24,9 +24,9 @@ from diffusers.utils.import_utils import is_xformers_available
 from peft import LoraConfig, PeftModel
 import omegaconf
 from omegaconf import OmegaConf
-from torchvision.utils import save_image
+from torchvision.utils import save_image, make_grid
 from torch.utils.data import DataLoader
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 import torch.nn.functional as F
 import torch
 from typing import Callable, Optional
@@ -142,16 +142,60 @@ class SanaRainDataModule(pl.LightningDataModule):
     def __init__(
         self,
         dataset_txt_or_dir_paths,
+        val_dataset_txt_or_dir_paths,
         resolution: int,
         batch_size: int,
+        val_batch_size: Optional[int],
         num_workers: int,
+        val_sample_enabled: bool = False,
+        val_sample_ratio: Optional[float] = None,
+        val_sample_max: Optional[int] = None,
+        val_sample_seed: Optional[int] = None,
     ):
         super().__init__()
         self.dataset_txt_or_dir_paths = dataset_txt_or_dir_paths
+        self.val_dataset_txt_or_dir_paths = val_dataset_txt_or_dir_paths
         self.resolution = int(resolution)
         self.batch_size = int(batch_size)
+        self.val_batch_size = int(val_batch_size) if val_batch_size is not None else int(batch_size)
         self.num_workers = int(num_workers)
+        self.val_sample_enabled = bool(val_sample_enabled)
+        self.val_sample_ratio = float(val_sample_ratio) if val_sample_ratio is not None else None
+        self.val_sample_max = int(val_sample_max) if val_sample_max is not None else None
+        self.val_sample_seed = int(val_sample_seed) if val_sample_seed is not None else None
         self.train_dataset = None
+        self.val_dataset = None
+
+    def _maybe_sample_val_dataset(self):
+        if self.val_dataset is None or not self.val_sample_enabled:
+            return
+
+        total = len(self.val_dataset)
+        if total <= 0:
+            return
+
+        target = total
+        if self.val_sample_ratio is not None:
+            if self.val_sample_ratio <= 0:
+                target = 0
+            elif self.val_sample_ratio < 1:
+                target = max(1, int(total * self.val_sample_ratio))
+            else:
+                target = total
+
+        if self.val_sample_max is not None and self.val_sample_max > 0:
+            target = min(target, self.val_sample_max)
+
+        if target <= 0:
+            self.val_dataset = Subset(self.val_dataset, [])
+            return
+
+        if target < total:
+            g = torch.Generator()
+            if self.val_sample_seed is not None:
+                g.manual_seed(self.val_sample_seed)
+            perm = torch.randperm(total, generator=g).tolist()
+            self.val_dataset = Subset(self.val_dataset, perm[:target])
 
     def setup(self, stage: Optional[str] = None):
         if (
@@ -169,11 +213,40 @@ class SanaRainDataModule(pl.LightningDataModule):
             self.train_dataset = PairedDataset(
                 self.dataset_txt_or_dir_paths, self.resolution)
 
+        if self.val_dataset_txt_or_dir_paths:
+            if (
+                isinstance(
+                    self.val_dataset_txt_or_dir_paths,
+                    (list, tuple, omegaconf.listconfig.ListConfig),
+                )
+                and len(self.val_dataset_txt_or_dir_paths) == 1
+                and str(self.val_dataset_txt_or_dir_paths[0]).lower().endswith(".csv")
+            ):
+                self.val_dataset = CSVPairsDataset(
+                    self.val_dataset_txt_or_dir_paths[0], self.resolution
+                )
+            else:
+                self.val_dataset = PairedDataset(
+                    self.val_dataset_txt_or_dir_paths, self.resolution
+                )
+            self._maybe_sample_val_dataset()
+
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+    def val_dataloader(self):
+        if self.val_dataset is None:
+            return None
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.val_batch_size,
+            shuffle=False,
             num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
         )
@@ -224,6 +297,9 @@ class OMGSR_SanaRain_Lightning(pl.LightningModule):
         self.shift_factor = 0.0
         self.scaling_factor = 1.0
         self.weight_dtype = torch.float32
+
+        self._val_vis_buffer = []
+        self._val_vis_count = 0
 
     def _infer_weight_dtype(self) -> torch.dtype:
         mp = str(getattr(self.args, "mixed_precision", "no")).lower()
@@ -458,11 +534,23 @@ class OMGSR_SanaRain_Lightning(pl.LightningModule):
 
     @rank_zero_only
     def _save_debug_image(self, global_step: int, lq_img, pred_img, hq_img):
+        save_imgs = (torch.stack([lq_img[0], pred_img[0], hq_img[0]], dim=0) + 1) / 2
+        grid = make_grid(save_imgs, nrow=3).float().clamp(0, 1)
+
+        prefer_wandb = bool(getattr(self.args, "save_img_to_wandb", True))
+        if prefer_wandb and isinstance(self.logger, WandbLogger):
+            self.logger.log_image(
+                key="train/compare",
+                images=[grid.detach().cpu()],
+                step=int(global_step),
+            )
+            return
+
+        # Fallback: keep old local save behavior if wandb is not available.
         img_path = os.path.join(self.args.output_dir, f"img-{global_step}.png")
-        save_imgs = (torch.stack(
-            [lq_img[0], pred_img[0], hq_img[0]], dim=0) + 1) / 2
-        save_image(save_imgs.detach().cpu(), img_path)
-        logger.info(f"img-{global_step}.png saved!")
+        os.makedirs(self.args.output_dir, exist_ok=True)
+        save_image(grid.detach().cpu(), img_path)
+        logger.info(f"img-{global_step}.png saved to local file (wandb disabled/unavailable)!")
 
     def training_step(self, batch, batch_idx):
         opt_sr, opt_disc = self.optimizers()
@@ -569,6 +657,79 @@ class OMGSR_SanaRain_Lightning(pl.LightningModule):
         )
         return total_G_loss.detach()
 
+    def validation_step(self, batch, batch_idx):
+        lq_img, hq_img = batch
+        lq_img = lq_img.to(self.device)
+        hq_img = hq_img.to(self.device)
+
+        with torch.no_grad():
+            hq_latent = encode_images(hq_img, self.fixed_vae, self.weight_dtype)
+            noise = torch.randn_like(hq_latent)
+            pretrained_noisy_latent = (1 - self.sigma_t) * hq_latent + self.sigma_t * noise
+
+            lq_latent = encode_images(lq_img, self.lora_vae, self.weight_dtype)
+
+            loss_LRR = F.mse_loss(pretrained_noisy_latent, lq_latent, reduction="mean")
+            pred_img = self.one_mid_timestep_pred(lq_latent)
+            loss_Dv3D = self.net_dv3d(pred_img, hq_img)
+            loss_L1 = F.l1_loss(pred_img, hq_img, reduction="mean")
+
+        if (
+            self.trainer.is_global_zero
+            and isinstance(self.logger, WandbLogger)
+            and int(getattr(self.args, "val/val_log_num_images", 0)) > 0
+        ):
+            remaining = int(self.args.val_log_num_images) - self._val_vis_count
+            if remaining > 0:
+                take_n = min(remaining, lq_img.shape[0])
+                lq_vis = lq_img[:take_n]
+                pred_vis = pred_img[:take_n]
+                hq_vis = hq_img[:take_n]
+                for i in range(take_n):
+                    triptych = torch.stack(
+                        [lq_vis[i], pred_vis[i], hq_vis[i]], dim=0
+                    )
+                    triptych = (triptych + 1) / 2
+                    grid = make_grid(triptych, nrow=3)
+                    grid = grid.float().clamp(0, 1)
+                    self._val_vis_buffer.append(grid.detach().cpu())
+                    self._val_vis_count += 1
+
+        loss_LRR_scaled = loss_LRR * float(self.args.lambda_LRR)
+        loss_Dv3D_scaled = loss_Dv3D * float(self.args.lambda_Dv3D)
+        loss_L1_scaled = loss_L1 * float(self.args.lambda_L1)
+        loss_total = loss_LRR_scaled + loss_Dv3D_scaled + loss_L1_scaled
+
+        self.log_dict(
+            {
+                "val/val_loss_LRR": loss_LRR_scaled,
+                "val/val_loss_Dv3D": loss_Dv3D_scaled,
+                "val/val_loss_L1": loss_L1_scaled,
+                "val/val_loss_total": loss_total,
+            },
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
+            logger=True,
+            sync_dist=True,
+        )
+
+    def on_validation_epoch_start(self) -> None:
+        self._val_vis_buffer = []
+        self._val_vis_count = 0
+
+    def on_validation_epoch_end(self) -> None:
+        if (
+            self.trainer.is_global_zero
+            and isinstance(self.logger, WandbLogger)
+            and len(self._val_vis_buffer) > 0
+        ):
+            self.logger.log_image(
+                key="val/compare",
+                images=self._val_vis_buffer,
+                step=int(self.opt_step),
+            )
+
     def on_train_end(self):
         if self.trainer.is_global_zero:
             self._save_weight(int(self.opt_step))
@@ -665,9 +826,15 @@ def main():
     else:
         datamodule = SanaRainDataModule(
             dataset_txt_or_dir_paths=args.dataset_txt_or_dir_paths,
+            val_dataset_txt_or_dir_paths=getattr(args, "val_dataset_txt_or_dir_paths", None),
             resolution=args.resolution,
             batch_size=args.train_batch_size,
+            val_batch_size=getattr(args, "val_batch_size", None),
             num_workers=args.dataloader_num_workers,
+            val_sample_enabled=bool(getattr(args, "val_sample_enabled", False)),
+            val_sample_ratio=getattr(args, "val_sample_ratio", None),
+            val_sample_max=getattr(args, "val_sample_max", None),
+            val_sample_seed=getattr(args, "val_sample_seed", getattr(args, "seed", None)),
         )
 
     model = OMGSR_SanaRain_Lightning(args)
@@ -698,6 +865,13 @@ def main():
         accelerator = "gpu" if torch.cuda.is_available() else "cpu"
     devices = int(getattr(args, "trainer_devices", 1))
 
+    trainer_kwargs = {}
+    if getattr(args, "val_check_interval", None) is not None:
+        vci = args.val_check_interval
+        trainer_kwargs["val_check_interval"] = int(vci) if float(vci) >= 1 else float(vci)
+    if getattr(args, "limit_val_batches", None) is not None:
+        trainer_kwargs["limit_val_batches"] = args.limit_val_batches
+
     trainer = pl.Trainer(
         default_root_dir=str(args.output_dir),
         logger=wandb_logger,
@@ -712,6 +886,7 @@ def main():
         num_nodes=1,
         plugins=[LightningEnvironment()],
         limit_train_batches=1 if int(args.max_train_steps) <= 1 else 1.0,
+        **trainer_kwargs,
     )
 
     trainer.fit(model, datamodule=datamodule)
