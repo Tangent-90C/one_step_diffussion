@@ -25,6 +25,11 @@ from peft import LoraConfig, PeftModel
 import omegaconf
 from omegaconf import OmegaConf
 from torchvision.utils import save_image, make_grid
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.kid import KernelInceptionDistance
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from eval.evaluate import eval_batch, _SkimageSSIM
+from eval.metrics import DISTS, MSSSIM, PSNR
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset, Subset
 import torch.nn.functional as F
@@ -301,6 +306,13 @@ class OMGSR_SanaRain_Lightning(pl.LightningModule):
         self._val_vis_buffer = []
         self._val_vis_count = 0
 
+        self._val_eval_metric_dict = None
+        self._val_eval_paired_dict = None
+        self._val_eval_fid = None
+        self._val_eval_kid = None
+        self._val_eval_sums = {}
+        self._val_eval_count = 0
+
     def _infer_weight_dtype(self) -> torch.dtype:
         mp = str(getattr(self.args, "mixed_precision", "no")).lower()
         if mp in {"bf16", "bf16-mixed"}:
@@ -403,6 +415,18 @@ class OMGSR_SanaRain_Lightning(pl.LightningModule):
             dinov3_convnext_size=self.args.dinov3_convnext_size,
             resolution=self.args.resolution,
         )
+
+        # Validation metrics (reuse eval/evaluate.py logic)
+        self._val_eval_metric_dict = {}
+        self._val_eval_paired_dict = {
+            "psnr": PSNR(data_range=1.0).to(self.device),
+            "dists": DISTS().to(self.device),
+            "ms_ssim": MSSSIM(data_range=1.0).to(self.device),
+            "ssim": _SkimageSSIM(),
+            "lpips": LearnedPerceptualImagePatchSimilarity(normalize=True).to(self.device),
+        }
+        self._val_eval_fid = FrechetInceptionDistance().to(self.device)
+        self._val_eval_kid = KernelInceptionDistance().to(self.device)
 
         if bool(self.args.allow_tf32) and torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -674,6 +698,26 @@ class OMGSR_SanaRain_Lightning(pl.LightningModule):
             loss_Dv3D = self.net_dv3d(pred_img, hq_img)
             loss_L1 = F.l1_loss(pred_img, hq_img, reduction="mean")
 
+            if self._val_eval_paired_dict is not None:
+                recon_batch = (pred_img.detach().float() + 1.0) / 2.0
+                gt_batch = (hq_img.detach().float() + 1.0) / 2.0
+                recon_batch = recon_batch.clamp(0, 1)
+                gt_batch = gt_batch.clamp(0, 1)
+                batch_result, batch_n = eval_batch(
+                    recon_batch=recon_batch,
+                    gt_batch=gt_batch,
+                    metric_dict=self._val_eval_metric_dict or {},
+                    metric_paired_dict=self._val_eval_paired_dict,
+                    fid_metric=self._val_eval_fid,
+                    kid_metric=self._val_eval_kid,
+                    use_amp=(self.device.type == "cuda"),
+                    patch_size=256,
+                    min_size=256,
+                )
+                for k, v in batch_result.items():
+                    self._val_eval_sums[k] = self._val_eval_sums.get(k, 0.0) + float(v)
+                self._val_eval_count += int(batch_n)
+
         if (
             self.trainer.is_global_zero
             and isinstance(self.logger, WandbLogger)
@@ -717,8 +761,50 @@ class OMGSR_SanaRain_Lightning(pl.LightningModule):
     def on_validation_epoch_start(self) -> None:
         self._val_vis_buffer = []
         self._val_vis_count = 0
+        self._val_eval_sums = {}
+        self._val_eval_count = 0
+        if self._val_eval_paired_dict is not None:
+            for metric in self._val_eval_paired_dict.values():
+                if hasattr(metric, "to"):
+                    metric.to(self.device)
+        if self._val_eval_fid is not None:
+            self._val_eval_fid.to(self.device)
+            self._val_eval_fid.reset()
+        if self._val_eval_kid is not None:
+            self._val_eval_kid.to(self.device)
+            self._val_eval_kid.reset()
 
     def on_validation_epoch_end(self) -> None:
+        if self._val_eval_count > 0 and self.trainer.is_global_zero:
+            eval_logs = {}
+            denom = max(1, self._val_eval_count)
+            for key, total in self._val_eval_sums.items():
+                eval_logs[f"val/eval_{key}"] = float(total) / float(denom)
+                
+            print("validation samples evaluated: ", self._val_eval_count)
+
+            if (
+                self._val_eval_fid is not None
+                and self._val_eval_kid is not None
+                and self._val_eval_count > 50
+            ):
+                eval_logs["val/eval_fid"] = float(self._val_eval_fid.compute())
+                kid_subset = int(getattr(self._val_eval_kid, "subset_size", 50))
+                if self._val_eval_count > kid_subset:
+                    kid_mean, kid_std = self._val_eval_kid.compute()
+                    eval_logs["val/eval_kid_mean"] = float(kid_mean)
+                    eval_logs["val/eval_kid_std"] = float(kid_std)
+
+            if eval_logs:
+                self.log_dict(
+                    eval_logs,
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                    logger=True,
+                    sync_dist=False,
+                )
+
         if (
             self.trainer.is_global_zero
             and isinstance(self.logger, WandbLogger)

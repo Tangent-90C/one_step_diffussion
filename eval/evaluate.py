@@ -184,7 +184,8 @@ def eval_batch(
     batch_n = int(recon_batch.shape[0])
 
     if metric_dict:
-        ctx = torch.cuda.amp.autocast() if use_amp else torch.autocast(device_type="cuda", enabled=False)
+        device_type = "cuda" if recon_batch.device.type == "cuda" else "cpu"
+        ctx = torch.cuda.amp.autocast() if use_amp else torch.autocast(device_type=device_type, enabled=False)
         with ctx:
             for key, metric in metric_dict.items():
                 value = metric(recon_batch)

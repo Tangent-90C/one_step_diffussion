@@ -28,7 +28,7 @@ resolution: 512
 train_batch_size: 1
 max_train_steps: 12000
 checkpointing_steps: 500
-save_img_steps: 50
+save_img_steps: 500
 save_img_to_wandb: True
 resume_from_checkpoint: null
 gradient_accumulation_steps: 4
