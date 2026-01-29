@@ -425,8 +425,13 @@ class OMGSR_SanaRain_Lightning(pl.LightningModule):
             "ssim": _SkimageSSIM(),
             "lpips": LearnedPerceptualImagePatchSimilarity(normalize=True).to(self.device),
         }
+        for metric in self._val_eval_paired_dict.values():
+            if hasattr(metric, "eval"):
+                metric.eval()
         self._val_eval_fid = FrechetInceptionDistance().to(self.device)
+        self._val_eval_fid.eval()
         self._val_eval_kid = KernelInceptionDistance().to(self.device)
+        self._val_eval_kid.eval()
 
         if bool(self.args.allow_tf32) and torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -767,11 +772,15 @@ class OMGSR_SanaRain_Lightning(pl.LightningModule):
             for metric in self._val_eval_paired_dict.values():
                 if hasattr(metric, "to"):
                     metric.to(self.device)
+                if hasattr(metric, "eval"):
+                    metric.eval()
         if self._val_eval_fid is not None:
             self._val_eval_fid.to(self.device)
+            self._val_eval_fid.eval()
             self._val_eval_fid.reset()
         if self._val_eval_kid is not None:
             self._val_eval_kid.to(self.device)
+            self._val_eval_kid.eval()
             self._val_eval_kid.reset()
 
     def on_validation_epoch_end(self) -> None:
