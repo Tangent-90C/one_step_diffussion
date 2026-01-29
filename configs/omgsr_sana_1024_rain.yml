@@ -5,11 +5,11 @@ fixed_prompt: ""   # empty prompt is ok!
 fixed_prompt_path: null
 dataset_txt_or_dir_paths: ['/home/chenjn/OMGSR/gtrain_pairs.csv']
 val_dataset_txt_or_dir_paths: ['/home/chenjn/OMGSR/gtrain_pairs_val.csv']
-val_batch_size: 1
-val_check_interval: 500
+val_batch_size: 2
+val_check_interval: 50
 val_sample_enabled: True
 val_sample_ratio: 1
-val_sample_max: 500
+val_sample_max: 300 # 抽样检测的最大图片数量
 val_sample_seed: 123
 val_log_num_images: 8
 
@@ -26,7 +26,9 @@ mid_timestep: 244
 output_dir: ./omgsr_trainings/omgsr_sana_1024_rain2
 resolution: 512
 train_batch_size: 1
-max_train_steps: 12000
+max_epochs: 10                     # 训练 epoch 数（Trainer 用这个控制总训练轮数）
+train_epoch_augment_multiplier: 1.0  # 训练集随机增强的“等效倍数”，>1 会增加每个 epoch 的步数
+max_steps_per_epoch: 100000         # 每个 epoch 最大步数上限（根据数据量计算后再取 min）
 checkpointing_steps: 500
 save_img_steps: 500
 save_img_to_wandb: True

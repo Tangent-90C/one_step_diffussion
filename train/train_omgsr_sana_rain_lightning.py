@@ -882,6 +882,7 @@ def main():
     # Merge CLI overrides into config (keep config as the single source of truth).
     if cli.dry_run_steps is not None:
         args.max_train_steps = int(cli.dry_run_steps)
+        args.max_epochs = 1
     if bool(cli.profile_memory):
         args.profile_memory = True
     if bool(cli.no_wandb):
@@ -967,10 +968,36 @@ def main():
     if getattr(args, "limit_val_batches", None) is not None:
         trainer_kwargs["limit_val_batches"] = args.limit_val_batches
 
+    per_epoch_steps = None
+    if getattr(args, "limit_train_batches", None) is None:
+        try:
+            datamodule.setup("fit")
+            train_len = len(datamodule.train_dataset) if datamodule.train_dataset is not None else 0
+        except Exception:
+            train_len = 0
+
+        if train_len > 0:
+            aug_mult = float(getattr(args, "train_epoch_augment_multiplier", 1.0))
+            if aug_mult <= 0:
+                aug_mult = 1.0
+            per_epoch_steps = math.ceil((train_len * aug_mult) / float(args.train_batch_size))
+            max_steps_per_epoch = int(getattr(args, "max_steps_per_epoch", per_epoch_steps))
+            if max_steps_per_epoch > 0:
+                per_epoch_steps = min(per_epoch_steps, max_steps_per_epoch)
+            trainer_kwargs["limit_train_batches"] = per_epoch_steps
+    else:
+        per_epoch_steps = None
+
+    max_epochs = int(getattr(args, "max_epochs", 1))
+    if per_epoch_steps is not None:
+        args.max_train_steps = int(per_epoch_steps * max_epochs)
+    elif getattr(args, "max_train_steps", None) is None:
+        args.max_train_steps = int(max_epochs)
+
     trainer = pl.Trainer(
         default_root_dir=str(args.output_dir),
         logger=wandb_logger,
-        max_steps=int(args.max_train_steps),
+        max_epochs=max_epochs,
         # Manual optimization: handle gradient accumulation inside training_step.
         accumulate_grad_batches=1,
         precision=precision,
@@ -980,7 +1007,6 @@ def main():
         devices=devices,
         num_nodes=1,
         plugins=[LightningEnvironment()],
-        limit_train_batches=1 if int(args.max_train_steps) <= 1 else 1.0,
         **trainer_kwargs,
     )
 
