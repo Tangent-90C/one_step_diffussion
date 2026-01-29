@@ -6,7 +6,7 @@ fixed_prompt_path: null
 dataset_txt_or_dir_paths: ['/home/chenjn/OMGSR/gtrain_pairs.csv']
 val_dataset_txt_or_dir_paths: ['/home/chenjn/OMGSR/gtrain_pairs_val.csv']
 val_batch_size: 2
-val_check_interval: 50
+val_check_interval: 500
 val_sample_enabled: True
 val_sample_ratio: 1
 val_sample_max: 300 # 抽样检测的最大图片数量
