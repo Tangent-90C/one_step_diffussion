@@ -744,7 +744,7 @@ class OMGSR_SanaRain_Lightning(pl.LightningModule):
         if (
             self.trainer.is_global_zero
             and isinstance(self.logger, WandbLogger)
-            and int(getattr(self.args, "val/val_log_num_images", 0)) > 0
+            and int(getattr(self.args, "val_log_num_images", 0)) > 0
         ):
             remaining = int(self.args.val_log_num_images) - self._val_vis_count
             if remaining > 0:
