@@ -42,6 +42,7 @@ import math
 import copy
  
 
+logger = logging.getLogger(__name__)
 
 # DINOv3 losses/disc
 
@@ -59,11 +60,10 @@ try:
         return _original_forward(self, timestep, guidance, hidden_dtype)
 
     SanaCombinedTimestepGuidanceEmbeddings.forward = _new_forward
-except Exception:
-    pass
+except Exception as e:
+    logger.warning("Failed to apply monkeypatch to SanaCombinedTimestepGuidanceEmbeddings: %s", e)
 
 
-logger = logging.getLogger(__name__)
 
 
 def encode_images(pixels: torch.Tensor, vae: torch.nn.Module, weight_dtype):
