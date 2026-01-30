@@ -5,3 +5,5 @@ experiments_omgsr_sana_rain/*
 omgsr_trainings/*
 .venv/
 .vscode/
+
+*.pth

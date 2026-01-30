@@ -1,3 +1,5 @@
+import os
+import logging
 import torch
 import numpy as np
 import torch.nn as nn
@@ -28,9 +30,48 @@ class L2pooling(nn.Module):
         )
         return (out + 1e-12).sqrt()
 
+logger = logging.getLogger(__name__)
+
 cur_path = "dinov3_gan"
+
+def _ensure_dinov3_weights(weights_path: str, size: str) -> str:
+    if os.path.isfile(weights_path):
+        return weights_path
+
+    os.makedirs(os.path.dirname(weights_path), exist_ok=True)
+
+    try:
+        from dinov3_gan.facebookresearch_dinov3_main.dinov3.hub import backbones as dinov3_backbones
+    except Exception as e:
+        raise FileNotFoundError(
+            f"DINOv3 weights not found: {weights_path}. "
+            "Failed to import DINOv3 hub utilities for auto-download."
+        ) from e
+
+    hash_map = {
+        "tiny": "21b726bb",
+        "small": "296db49d",
+        "base": "801f2ba9",
+        "large": "61fa432d",
+    }
+    if size not in hash_map:
+        raise ValueError(f"Unknown dinov3_convnext_size: {size}")
+
+    url = dinov3_backbones._make_dinov3_convnext_model_url(
+        compact_arch_name=f"convnext_{size}",
+        weights=dinov3_backbones.Weights.LVD1689M,
+        hash=hash_map[size],
+    )
+    logger.info("Downloading DINOv3 weights from %s to %s", url, weights_path)
+    state_dict = torch.hub.load_state_dict_from_url(
+        url,
+        map_location="cpu",
+        progress=True,
+    )
+    torch.save(state_dict, weights_path)
+    return weights_path
 class L2PooledDINOv3ConvNext(torch.nn.Module):
-    def __init__(self, dinov3_convnext_size):
+    def __init__(self, dinov3_convnext_size, repo_path: str | None = None, weights_path: str | None = None):
         super().__init__()
         dinov3_convnext_weights = {
             'tiny': 'dinov3_convnext_tiny_pretrain_lvd1689m-21b726bb.pth',
@@ -39,11 +80,26 @@ class L2PooledDINOv3ConvNext(torch.nn.Module):
             'large':'dinov3_convnext_large_pretrain_lvd1689m-61fa432d.pth',
         }
         assert dinov3_convnext_size in dinov3_convnext_weights.keys(), f'`dinov3_convnext_size` must be in {dinov3_convnext_weights.keys()}'
+        if repo_path is None:
+            repo_path = f"{cur_path}/facebookresearch_dinov3_main"
+        if weights_path is None:
+            weights_path = os.path.join(
+                cur_path,
+                "dinov3_weights",
+                dinov3_convnext_weights[dinov3_convnext_size],
+            )
+        elif os.path.isdir(weights_path):
+            weights_path = os.path.join(
+                weights_path,
+                dinov3_convnext_weights[dinov3_convnext_size],
+            )
+        if not os.path.isfile(weights_path):
+            weights_path = _ensure_dinov3_weights(weights_path, dinov3_convnext_size)
         self.model = torch.hub.load(
-            repo_or_dir=f'{cur_path}/facebookresearch_dinov3_main', 
+            repo_or_dir=repo_path, 
             model=f'dinov3_convnext_{dinov3_convnext_size}', 
             source='local',
-            weights=f"{cur_path}/dinov3_weights/dinov3_convnext_large_pretrain_lvd1689m-61fa432d.pth")  
+            weights=weights_path)
         
         self.model.requires_grad_(False)
         self.model.eval()
@@ -77,9 +133,13 @@ class L2PooledDINOv3ConvNext(torch.nn.Module):
         return [x] + pooled_feats 
 
 class DINOv3ConvNeXtDISTS(torch.nn.Module):
-    def __init__(self, dinov3_convnext_size):
+    def __init__(self, dinov3_convnext_size, repo_path: str | None = None, weights_path: str | None = None):
         super().__init__()
-        self.l2pooled_dinov3_convnext = L2PooledDINOv3ConvNext(dinov3_convnext_size)        
+        self.l2pooled_dinov3_convnext = L2PooledDINOv3ConvNext(
+            dinov3_convnext_size,
+            repo_path=repo_path,
+            weights_path=weights_path,
+        )        
         self.channels = [3] + self.l2pooled_dinov3_convnext.chns[:3]
         self.init_value = 1 / (2 * sum(self.channels))
 

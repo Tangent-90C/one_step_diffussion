@@ -1,4 +1,4 @@
-model: omgsr_sana_1024
+model: omgsr_sana_512
 seed: 123
 model_path: /mnt/HDD-data/jianuo/models/Sana_Sprint_1.6B_1024px_diffusers
 fixed_prompt: ""   # empty prompt is ok!
@@ -17,13 +17,16 @@ vae_lora_rank: 64
 transformer_lora_rank: 64
 
 dinov3_convnext_size: large      # tiny, small, base, large
+dinov3_repo_path: dinov3_gan/facebookresearch_dinov3_main            # 可选：本地 DINOv3 仓库路径（默认使用 dinov3_gan/facebookresearch_dinov3_main）
+dinov3_weights_path: dinov3_gan/dinov3_weights/         # 可选：本地权重 .pth 路径（默认使用 dinov3_gan/dinov3_weights/ 里的对应权重）
+torch_home: /mnt/HDD-data/jianuo/models/torch_cache                  # 可选：Torch Hub/torchvision 权重缓存目录（影响 FID/KID 的 Inception 权重）
 lambda_LRR: 5
 lambda_Dv3D: 5
 lambda_L1: 0.5
 lambda_GAN: 0.5
 mid_timestep: 244 
 
-output_dir: ./omgsr_trainings/omgsr_sana_1024_rain2
+output_dir: ./omgsr_trainings/omgsr_sana_512_rain2
 resolution: 512
 train_batch_size: 1
 max_epochs: 10                     # 训练 epoch 数（Trainer 用这个控制总训练轮数）

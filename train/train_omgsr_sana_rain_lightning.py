@@ -409,11 +409,15 @@ class OMGSR_SanaRain_Lightning(pl.LightningModule):
             self.sana_transformer.enable_gradient_checkpointing()
 
         self.net_dv3d = DINOv3ConvNeXtDISTS(
-            dinov3_convnext_size=self.args.dinov3_convnext_size
+            dinov3_convnext_size=self.args.dinov3_convnext_size,
+            repo_path=getattr(self.args, "dinov3_repo_path", None),
+            weights_path=getattr(self.args, "dinov3_weights_path", None),
         )
         self.net_disc = Dinov3ConvNeXtDiscriminator(
             dinov3_convnext_size=self.args.dinov3_convnext_size,
             resolution=self.args.resolution,
+            repo_path=getattr(self.args, "dinov3_repo_path", None),
+            weights_path=getattr(self.args, "dinov3_weights_path", None),
         )
 
         # Validation metrics (reuse eval/evaluate.py logic)
@@ -896,6 +900,15 @@ def parse_args():
 def main():
     cli = parse_args()
     args = OmegaConf.load(cli.config)
+
+    # Allow overriding torch hub cache path (affects FID/KID inception weights, etc.).
+    torch_home = getattr(args, "torch_home", None)
+    if torch_home:
+        os.environ["TORCH_HOME"] = str(torch_home)
+        try:
+            torch.hub.set_dir(str(torch_home))
+        except Exception as e:
+            logger.warning("Failed to set torch hub cache dir: %s", e)
 
     # Merge CLI overrides into config (keep config as the single source of truth).
     if cli.dry_run_steps is not None:
